@@ -48,15 +48,19 @@ export default function Chat() {
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
-  const { data: usersData, error: usersError } = useQuery(GET_USERS, {
-    onError: (err) => {
-      if (err.message?.includes('Signature has expired') || err.message?.includes('Not authenticated')) {
+  const { data: usersData, error: usersError } = useQuery(GET_USERS);
+
+  // Handle auth errors via side-effect to avoid React warning
+  useEffect(() => {
+    if (usersError) {
+      if (usersError.message?.includes('Signature has expired') || usersError.message?.includes('Not authenticated')) {
         localStorage.removeItem('token');
         localStorage.removeItem('username');
         window.location.href = '/signin';
       }
     }
-  });
+  }, [usersError]);
+
 
   useEffect(() => {
     if (usersData) {
