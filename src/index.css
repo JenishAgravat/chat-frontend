@@ -236,7 +236,19 @@ body {
   font-size: 0.75rem;
   color: var(--success);
   font-weight: 500;
+  display: flex;
+  align-items: center;
+  gap: 0.3rem;
 }
+
+.status-text.reconnecting {
+  color: #f59e0b;
+}
+
+.status-text svg {
+  opacity: 0.8;
+}
+
 
 .icon-btn {
   background: none;

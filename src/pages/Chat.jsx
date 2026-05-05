@@ -231,7 +231,7 @@ export default function Chat() {
             </div>
             <div className="sidebar-user-name">
               <span className="username-text">{me?.username}</span>
-              <span className="status-text">
+              <span className={`status-text ${!wsConnected ? 'reconnecting' : ''}`}>
                 {wsConnected ? <><Wifi size={10} /> Connected</> : <><WifiOff size={10} /> Reconnecting...</>}
               </span>
             </div>
