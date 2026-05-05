@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { gql, useQuery } from '@apollo/client';
 import { WS_URL } from '../apolloClient';
-import { LogOut, Send, User as UserIcon, Reply, X, MessageCircle } from 'lucide-react';
+import { LogOut, Send, User as UserIcon, Reply, X, MessageCircle, Wifi, WifiOff } from 'lucide-react';
 
 const GET_USERS = gql`
   query GetUsers {
@@ -41,12 +41,22 @@ export default function Chat() {
   const [hoverMsg, setHoverMsg] = useState(null);
   const [replyTo, setReplyTo] = useState(null);
   const [showMobileSidebar, setShowMobileSidebar] = useState(true);
+  const [wsConnected, setWsConnected] = useState(false);
   const ws = useRef(null);
   const isClosingIntentionally = useRef(false);
+  const reconnectTimer = useRef(null);
   const messagesEndRef = useRef(null);
   const inputRef = useRef(null);
 
-  const { data: usersData } = useQuery(GET_USERS);
+  const { data: usersData, error: usersError } = useQuery(GET_USERS, {
+    onError: (err) => {
+      if (err.message?.includes('Signature has expired') || err.message?.includes('Not authenticated')) {
+        localStorage.removeItem('token');
+        localStorage.removeItem('username');
+        window.location.href = '/signin';
+      }
+    }
+  });
 
   useEffect(() => {
     if (usersData) {
@@ -57,8 +67,8 @@ export default function Chat() {
 
   const { refetch: fetchMessages } = useQuery(GET_MESSAGES, { skip: true });
 
-  // ── WebSocket connection (once on mount) ──
-  useEffect(() => {
+  // ── WebSocket with auto-reconnect ──
+  const connectWebSocket = useCallback(() => {
     const token = localStorage.getItem('token');
     if (!token || token === 'undefined') {
       localStorage.removeItem('token');
@@ -66,7 +76,6 @@ export default function Chat() {
       return;
     }
 
-    // Check JWT expiry
     try {
       const payload = JSON.parse(atob(token.split('.')[1]));
       if (payload.exp * 1000 < Date.now()) {
@@ -74,43 +83,41 @@ export default function Chat() {
         window.location.href = '/signin';
         return;
       }
-    } catch (_) {
+    } catch {
       localStorage.removeItem('token');
       window.location.href = '/signin';
       return;
     }
 
+    if (ws.current && ws.current.readyState === WebSocket.OPEN) return;
+
     isClosingIntentionally.current = false;
     const socket = new WebSocket(`${WS_URL}/ws/chat/?token=${token}`);
     ws.current = socket;
 
+    socket.onopen = () => setWsConnected(true);
+
     socket.onmessage = (event) => {
       const data = JSON.parse(event.data);
-
       if (data.type === 'user_status') {
         setUsers(prev => prev.map(u =>
           u.id.toString() === data.user_id.toString()
-            ? { ...u, isOnline: data.is_online }
-            : u
+            ? { ...u, isOnline: data.is_online } : u
         ));
       } else if (data.type === 'chat_message') {
-        setMessages(prev => [
-          ...prev,
-          {
-            id: data.message_id,
-            content: data.content,
-            sender: { id: data.sender_id },
-            receiver: { id: data.receiver_id },
-            timestamp: data.timestamp,
-            reaction: data.reaction || null,
-            replyTo: data.reply_to_id ? { id: data.reply_to_id, content: data.reply_to_content } : null,
-          }
-        ]);
+        setMessages(prev => [...prev, {
+          id: data.message_id,
+          content: data.content,
+          sender: { id: data.sender_id },
+          receiver: { id: data.receiver_id },
+          timestamp: data.timestamp,
+          reaction: data.reaction || null,
+          replyTo: data.reply_to_id ? { id: data.reply_to_id, content: data.reply_to_content } : null,
+        }]);
       } else if (data.type === 'reaction_update') {
         setMessages(prev => prev.map(m =>
           m.id?.toString() === data.message_id?.toString()
-            ? { ...m, reaction: data.reaction }
-            : m
+            ? { ...m, reaction: data.reaction } : m
         ));
       } else if (data.type === 'notification') {
         const notif = { id: Date.now(), text: data.message };
@@ -121,81 +128,76 @@ export default function Chat() {
 
     socket.onerror = () => {};
     socket.onclose = () => {
+      setWsConnected(false);
       if (!isClosingIntentionally.current) {
-        console.warn('Chat connection lost. Refresh to reconnect.');
+        reconnectTimer.current = setTimeout(connectWebSocket, 3000);
       }
-    };
-
-    return () => {
-      isClosingIntentionally.current = true;
-      socket.close();
     };
   }, []);
 
-  // ── Load messages when switching active user ──
+  useEffect(() => {
+    connectWebSocket();
+    return () => {
+      isClosingIntentionally.current = true;
+      if (reconnectTimer.current) clearTimeout(reconnectTimer.current);
+      if (ws.current) ws.current.close();
+    };
+  }, [connectWebSocket]);
+
+  // ── Load messages ──
   useEffect(() => {
     if (activeUser) {
       fetchMessages({ userId: parseInt(activeUser.id) }).then(({ data }) => {
         if (data?.messages) setMessages(data.messages);
-      });
+      }).catch(() => {});
     }
   }, [activeUser, fetchMessages]);
 
-  // ── Auto-scroll ──
   useEffect(() => {
     messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
-  // ── Send message (normal or reply) ──
   const handleSendMessage = (e) => {
     e.preventDefault();
     if (!messageInput.trim() || !activeUser) return;
-    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
-
-    const payload = {
-      type: 'chat_message',
-      receiver_id: activeUser.id,
-      content: messageInput,
-    };
-
-    if (replyTo) {
-      payload.reply_to = replyTo.id;
+    if (!ws.current || ws.current.readyState !== WebSocket.OPEN) {
+      const notif = { id: Date.now(), text: 'Connection lost. Reconnecting...' };
+      setNotifications(prev => [...prev, notif]);
+      setTimeout(() => setNotifications(prev => prev.filter(n => n.id !== notif.id)), 3000);
+      connectWebSocket();
+      return;
     }
+
+    const payload = { type: 'chat_message', receiver_id: activeUser.id, content: messageInput };
+    if (replyTo) payload.reply_to = replyTo.id;
 
     ws.current.send(JSON.stringify(payload));
     setMessageInput('');
     setReplyTo(null);
   };
 
-  // ── Add reaction via WebSocket ──
   const handleReaction = useCallback((msgId, emoji) => {
     if (!ws.current || ws.current.readyState !== WebSocket.OPEN) return;
-    ws.current.send(JSON.stringify({
-      type: 'add_reaction',
-      message_id: msgId,
-      reaction: emoji,
-    }));
-    // Optimistic update
+    ws.current.send(JSON.stringify({ type: 'add_reaction', message_id: msgId, reaction: emoji }));
     setMessages(prev => prev.map(m =>
       m.id?.toString() === msgId?.toString() ? { ...m, reaction: emoji } : m
     ));
     setHoverMsg(null);
   }, []);
 
-  // ── Reply ──
   const handleReply = useCallback((msg) => {
     setReplyTo(msg);
     setTimeout(() => inputRef.current?.focus(), 50);
   }, []);
 
-  // ── Logout ──
   const handleLogout = () => {
+    isClosingIntentionally.current = true;
+    if (ws.current) ws.current.close();
     localStorage.removeItem('token');
     localStorage.removeItem('username');
     window.location.href = '/signin';
   };
 
-  // ── Select user (mobile: switch to chat view) ──
   const selectUser = (user) => {
     setActiveUser(user);
     setShowMobileSidebar(false);
@@ -205,23 +207,21 @@ export default function Chat() {
 
   const formatTime = (ts) => {
     if (!ts) return '';
-    const d = new Date(ts);
-    return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+    return new Date(ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   };
 
   return (
     <div className="chat-container">
-      {/* ── Notifications ── */}
+      {/* Notifications */}
       <div className="notification-stack">
         {notifications.map(n => (
           <div key={n.id} className="notification">
-            <MessageCircle size={16} />
-            {n.text}
+            <MessageCircle size={16} /> {n.text}
           </div>
         ))}
       </div>
 
-      {/* ── Sidebar ── */}
+      {/* Sidebar */}
       <div className={`sidebar ${showMobileSidebar ? 'mobile-show' : 'mobile-hide'}`}>
         <div className="sidebar-header">
           <div className="sidebar-user-info">
@@ -231,7 +231,9 @@ export default function Chat() {
             </div>
             <div className="sidebar-user-name">
               <span className="username-text">{me?.username}</span>
-              <span className="status-text">Online</span>
+              <span className="status-text">
+                {wsConnected ? <><Wifi size={10} /> Connected</> : <><WifiOff size={10} /> Reconnecting...</>}
+              </span>
             </div>
           </div>
           <button onClick={handleLogout} className="icon-btn" title="Sign out">
@@ -239,11 +241,12 @@ export default function Chat() {
           </button>
         </div>
 
-        <div className="sidebar-search">
-          <input type="text" placeholder="Search conversations..." readOnly />
-        </div>
-
         <div className="user-list">
+          {users.length === 0 && (
+            <div style={{ padding: '2rem 1rem', textAlign: 'center', color: 'var(--text-muted)', fontSize: '0.85rem' }}>
+              No other users yet. Share the link!
+            </div>
+          )}
           {users.map(user => (
             <div
               key={user.id}
@@ -265,17 +268,12 @@ export default function Chat() {
         </div>
       </div>
 
-      {/* ── Chat area ── */}
+      {/* Chat area */}
       <div className={`chat-main ${!showMobileSidebar ? 'mobile-show' : 'mobile-hide'}`}>
         {activeUser ? (
           <>
             <div className="chat-header">
-              <button 
-                className="back-btn icon-btn" 
-                onClick={() => setShowMobileSidebar(true)}
-              >
-                ←
-              </button>
+              <button className="back-btn icon-btn" onClick={() => setShowMobileSidebar(true)}>←</button>
               <div className="avatar avatar-sm">
                 {activeUser.username.charAt(0).toUpperCase()}
                 <div className={`status-indicator ${activeUser.isOnline ? 'online' : ''}`}></div>
@@ -305,27 +303,20 @@ export default function Chat() {
                       onMouseLeave={() => setHoverMsg(null)}
                     >
                       <div className={`message-bubble ${isSent ? 'sent' : 'received'}`}>
-                        {/* Reply preview */}
                         {msg.replyTo && (
                           <div className="reply-preview">
                             <div className="reply-preview-label">↩ Reply</div>
                             <div className="reply-preview-text">
-                              {typeof msg.replyTo === 'object' 
-                                ? msg.replyTo.content?.slice(0, 50) 
-                                : 'Original message'}
+                              {typeof msg.replyTo === 'object' ? msg.replyTo.content?.slice(0, 50) : 'Original message'}
                             </div>
                           </div>
                         )}
-
                         <div className="message-content">{msg.content}</div>
-
                         <div className="message-meta">
                           <span className="message-time">{formatTime(msg.timestamp)}</span>
                           {msg.reaction && <span className="reaction-badge">{msg.reaction}</span>}
                         </div>
                       </div>
-
-                      {/* Hover actions */}
                       {hoverMsg === msg.id && (
                         <div className={`msg-actions ${isSent ? 'actions-left' : 'actions-right'}`}>
                           <button className="action-btn" onClick={() => handleReply(msg)} title="Reply">
@@ -333,9 +324,7 @@ export default function Chat() {
                           </button>
                           <div className="emoji-picker-mini">
                             {EMOJIS.map(e => (
-                              <span key={e} className="emoji-option" onClick={() => handleReaction(msg.id, e)}>
-                                {e}
-                              </span>
+                              <span key={e} className="emoji-option" onClick={() => handleReaction(msg.id, e)}>{e}</span>
                             ))}
                           </div>
                         </div>
@@ -346,7 +335,6 @@ export default function Chat() {
               <div ref={messagesEndRef} />
             </div>
 
-            {/* ── Input area ── */}
             <form className="message-input-area" onSubmit={handleSendMessage}>
               {replyTo && (
                 <div className="reply-bar">
@@ -360,14 +348,8 @@ export default function Chat() {
                 </div>
               )}
               <div className="input-row">
-                <input
-                  ref={inputRef}
-                  type="text"
-                  placeholder="Type a message..."
-                  value={messageInput}
-                  onChange={(e) => setMessageInput(e.target.value)}
-                  autoComplete="off"
-                />
+                <input ref={inputRef} type="text" placeholder="Type a message..." value={messageInput}
+                  onChange={(e) => setMessageInput(e.target.value)} autoComplete="off" />
                 <button type="submit" className="send-btn" disabled={!messageInput.trim()}>
                   <Send size={18} />
                 </button>
@@ -376,10 +358,8 @@ export default function Chat() {
           </>
         ) : (
           <div className="empty-chat">
-            <div className="empty-chat-icon">
-              <MessageCircle size={72} strokeWidth={1} />
-            </div>
-            <h2>Welcome back{me ? `, ${me.username}` : ''}!</h2>
+            <div className="empty-chat-icon"><MessageCircle size={72} strokeWidth={1} /></div>
+            <h2>Welcome{me ? `, ${me.username}` : ''}!</h2>
             <p>Select a conversation to start messaging</p>
           </div>
         )}
