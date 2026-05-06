@@ -22,5 +22,6 @@ export const client = new ApolloClient({
   cache: new InMemoryCache()
 });
 
-// Export for WebSocket usage
-export const WS_URL = (import.meta.env.VITE_WS_URL || 'ws://localhost:8000').replace(/\/$/, '');
+// Export for WebSocket usage with protocol-agnostic fallback
+const fallbackProtocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
+export const WS_URL = (import.meta.env.VITE_WS_URL || `${fallbackProtocol}//localhost:8000`).replace(/\/$/, '');
