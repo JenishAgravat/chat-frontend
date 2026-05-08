@@ -20,7 +20,7 @@ export default function SignIn() {
     onCompleted: (data) => {
       localStorage.setItem('token', data.tokenAuth.token);
       localStorage.setItem('username', username);
-      window.location.href = '/chat';
+      navigate('/chat');
     }
   });
 

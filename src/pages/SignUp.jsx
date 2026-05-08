@@ -24,7 +24,7 @@ export default function SignUp() {
     onCompleted: (data) => {
       localStorage.setItem('token', data.createUser.token);
       localStorage.setItem('username', data.createUser.user.username);
-      window.location.href = '/chat';
+      navigate('/chat');
     }
   });
 
